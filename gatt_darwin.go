@@ -2,6 +2,7 @@ package gobtusb
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/tinygo-org/cbgo"
 )
@@ -21,8 +22,21 @@ func (c *coreBluetoothCharacteristic) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// WriteWithoutResponse queues p, first waiting until CoreBluetooth has room:
+// it silently drops writes made while canSendWriteWithoutResponse is false.
 func (c *coreBluetoothCharacteristic) WriteWithoutResponse(p []byte) (int, error) {
-	c.dev.prph.WriteCharacteristic(p, c.chr, false)
+	d := c.dev
+	timeout := time.After(cbOpTimeout)
+	for !d.prph.CanSendWriteWithoutResponse() {
+		select {
+		case <-d.wwrReady:
+		case <-d.disc:
+			return 0, ErrNotConnected
+		case <-timeout:
+			return 0, fmt.Errorf("write without response to %s: timed out waiting for CoreBluetooth to accept it", c.UUID())
+		}
+	}
+	d.prph.WriteCharacteristic(p, c.chr, false)
 	return len(p), nil
 }
 

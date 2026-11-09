@@ -29,15 +29,20 @@ type coreBluetoothDevice struct {
 
 	disc     chan struct{} // closed on disconnection
 	discOnce sync.Once
+
+	// wwrReady is signalled when CoreBluetooth can queue another write
+	// without response (peripheralIsReadyToSendWriteWithoutResponse).
+	wwrReady chan struct{}
 }
 
 func newCoreBluetoothDevice(a *coreBluetoothAdapter, prph cbgo.Peripheral, addr Address) *coreBluetoothDevice {
 	return &coreBluetoothDevice{
-		adapter: a,
-		prph:    prph,
-		addr:    addr,
-		notify:  make(map[string]func([]byte)),
-		disc:    make(chan struct{}),
+		adapter:  a,
+		prph:     prph,
+		addr:     addr,
+		notify:   make(map[string]func([]byte)),
+		disc:     make(chan struct{}),
+		wwrReady: make(chan struct{}, 1),
 	}
 }
 
@@ -142,6 +147,15 @@ func (s *coreBluetoothService) DiscoverCharacteristics(uuids []UUID) ([]Characte
 }
 
 // PeripheralDelegate
+func (a *coreBluetoothAdapter) IsReadyToSendWriteWithoutResponse(prph cbgo.Peripheral) {
+	if dev := a.device(prph); dev != nil {
+		select {
+		case dev.wwrReady <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func (a *coreBluetoothAdapter) DidDiscoverServices(prph cbgo.Peripheral, err error) {
 	if dev := a.device(prph); dev != nil {
 		dev.complete(err)
