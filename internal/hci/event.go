@@ -119,6 +119,15 @@ func (e Event) LESubevent() (uint8, error) {
 	return e.Params[0], nil
 }
 
+// Advertising report event types (4.E.7.7.65.2).
+const (
+	AdvInd        = 0x00 // connectable, scannable undirected
+	AdvDirectInd  = 0x01
+	AdvScanInd    = 0x02 // scannable undirected
+	AdvNonconnInd = 0x03
+	ScanRsp       = 0x04
+)
+
 // AdvertisingReport is a single report inside an LE Advertising Report event.
 type AdvertisingReport struct {
 	EventType uint8

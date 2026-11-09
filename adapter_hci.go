@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,6 +300,7 @@ func (a *hciAdapter) Scan(callback func(ScanResult)) error {
 func (a *hciAdapter) scanReadLoop(ctx context.Context, sess *hciScanSession, results chan<- ScanResult) {
 	defer close(sess.readDone)
 	defer close(results)
+	merged := advMerger{}
 	for {
 		ev, err := a.readEventCtx(ctx)
 		if err != nil {
@@ -310,7 +312,7 @@ func (a *hciAdapter) scanReadLoop(ctx context.Context, sess *hciScanSession, res
 		if reports, err := ev.AdvertisingReports(); err == nil {
 			for _, r := range reports {
 				select {
-				case results <- scanResultFromReport(r):
+				case results <- scanResultFromReport(merged.merge(r)):
 				default: // delivery backlog; drop rather than stall the reader
 				}
 			}
@@ -345,14 +347,58 @@ func (a *hciAdapter) StopScan() error {
 	return nil
 }
 
+// advMerger joins each peer's advertisement with its scan response. The
+// controller reports them separately, and peers commonly put the name in the
+// scan response once the primary payload's 31 bytes are used up; CoreBluetooth
+// delivers them merged, so we do the same.
+type advMerger map[[7]byte]*advPair
+
+type advPair struct{ adv, rsp []byte }
+
+// maxMergedPeers bounds the cache in busy environments; it is simply reset
+// when full, costing at most one unmerged report per peer.
+const maxMergedPeers = 256
+
+// mergedReport is an advertising report whose Data holds the advertisement
+// followed by the scan response, the first advLen bytes being the former.
+type mergedReport struct {
+	hci.AdvertisingReport
+	advLen int
+}
+
+// merge returns r with its payload extended by the peer's latest counterpart
+// (scan response for an advertisement, or vice versa), if one has been seen.
+func (m advMerger) merge(r hci.AdvertisingReport) mergedReport {
+	if r.EventType != hci.AdvInd && r.EventType != hci.AdvScanInd && r.EventType != hci.ScanRsp {
+		return mergedReport{r, len(r.Data)} // not scannable: there is no scan response to join
+	}
+	key := [7]byte{r.AddrType}
+	copy(key[1:], r.Addr[:])
+	p := m[key]
+	if p == nil {
+		if len(m) >= maxMergedPeers {
+			clear(m)
+		}
+		p = &advPair{}
+		m[key] = p
+	}
+	if r.EventType == hci.ScanRsp {
+		p.rsp = r.Data
+	} else {
+		p.adv = r.Data
+	}
+	r.Data = slices.Concat(p.adv, p.rsp) // AD structures concatenate as-is
+	return mergedReport{r, len(p.adv)}
+}
+
 // scanResultFromReport converts an HCI advertising report into a ScanResult.
-func scanResultFromReport(r hci.AdvertisingReport) ScanResult {
+func scanResultFromReport(r mergedReport) ScanResult {
 	var addr Address
 	for i := range 6 {
 		addr.MAC[i] = r.Addr[5-i]
 	}
 	addr.IsRandom = r.AddrType == hci.AddressRandom
-	return ScanResult{Address: addr, RSSI: r.RSSI, payload: r.Data}
+	return ScanResult{Address: addr, RSSI: r.RSSI, payload: r.Data, split: true, advLen: r.advLen}
 }
 
 // Connect establishes an LE connection to the peripheral at addr, then drives

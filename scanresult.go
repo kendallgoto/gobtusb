@@ -11,8 +11,14 @@ type ScanResult struct {
 	RSSI int8
 
 	// payload is the raw advertising data (a sequence of length-type-value AD
-	// structures).
+	// structures): the advertisement, then the scan response if any.
 	payload []byte
+
+	// split reports whether the backend knows where the advertisement ends
+	// and the scan response begins (at advLen). CoreBluetooth only exposes
+	// the two merged.
+	split  bool
+	advLen int
 }
 
 // AdvertisementData returns a copy of the raw advertising payload.
@@ -41,25 +47,30 @@ func (r ScanResult) LocalName() string {
 
 // HasServiceUUID reports whether the advertisement lists the given service UUID
 func (r ScanResult) HasServiceUUID(uuid UUID) bool {
+	return slices.Contains(r.ServiceUUIDs(), uuid)
+}
+
+// ServiceUUIDs returns the service UUIDs the advertisement lists, complete or
+// incomplete, in the order received.
+func (r ScanResult) ServiceUUIDs() []UUID {
+	var out []UUID
 	for _, ad := range r.adStructures() {
 		var width int
 		switch ad.typ {
-		case 0x02, 0x03: // incomplete/complete list of 16-bit UUIDs
+		case 0x02, 0x03:
 			width = 2
-		case 0x04, 0x05: // 32-bit UUIDs
+		case 0x04, 0x05:
 			width = 4
-		case 0x06, 0x07: // 128-bit UUIDs
+		case 0x06, 0x07:
 			width = 16
 		default:
 			continue
 		}
 		for i := 0; i+width <= len(ad.data); i += width {
-			if advUUID(ad.data[i:i+width]) == uuid {
-				return true
-			}
+			out = append(out, advUUID(ad.data[i:i+width]))
 		}
 	}
-	return false
+	return out
 }
 
 // ServiceDataElement is a single Service Data AD structure
@@ -98,8 +109,9 @@ func (r ScanResult) ServiceData() []ServiceDataElement {
 }
 
 type adStructure struct {
-	typ  byte
-	data []byte
+	typ    byte
+	data   []byte
+	offset int // of the length byte within the payload
 }
 
 // adStructures splits the payload into TLV AD structures
@@ -111,10 +123,57 @@ func (r ScanResult) adStructures() []adStructure {
 			break
 		}
 		out = append(out, adStructure{
-			typ:  r.payload[i+1],
-			data: r.payload[i+2 : i+1+length],
+			typ:    r.payload[i+1],
+			data:   r.payload[i+2 : i+1+length],
+			offset: i,
 		})
 		i += 1 + length
+	}
+	return out
+}
+
+// ADSource says which packet an AD structure arrived in.
+type ADSource int
+
+const (
+	// SourceUnknown: the backend merges the two (CoreBluetooth).
+	SourceUnknown ADSource = iota
+	SourceAdvertisement
+	SourceScanResponse
+)
+
+func (s ADSource) String() string {
+	switch s {
+	case SourceAdvertisement:
+		return "advertisement"
+	case SourceScanResponse:
+		return "scan_response"
+	}
+	return "unknown"
+}
+
+// ADStructure is one length-type-value element of the advertising payload
+// (Core Supplement Part A), undecoded.
+type ADStructure struct {
+	Type   byte // AD type from the BT SIG Assigned Numbers
+	Data   []byte
+	Source ADSource
+}
+
+// Structures returns every AD structure received, in order, tagged with the
+// packet it came in. On CoreBluetooth the payload is re-encoded from the
+// fields it exposes, so sources are unknown and some types are absent.
+func (r ScanResult) Structures() []ADStructure {
+	var out []ADStructure
+	for _, ad := range r.adStructures() {
+		src := SourceUnknown
+		if r.split {
+			src = SourceAdvertisement
+			if ad.offset >= r.advLen {
+				src = SourceScanResponse
+			}
+		}
+		out = append(out, ADStructure{Type: ad.typ, Data: slices.Clone(ad.data), Source: src})
 	}
 	return out
 }
