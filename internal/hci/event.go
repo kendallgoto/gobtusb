@@ -3,6 +3,7 @@ package hci
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 // ErrShortPacket is returned when a buffer is too small to hold the packet it
@@ -12,6 +13,7 @@ var ErrShortPacket = errors.New("hci: short packet")
 // HCI event codes (4.E.7.7)
 const (
 	EventDisconnectionComplete    = 0x05
+	EventEncryptionChange         = 0x08
 	EventCommandComplete          = 0x0E
 	EventCommandStatus            = 0x0F
 	EventNumberOfCompletedPackets = 0x13
@@ -22,6 +24,7 @@ const (
 const (
 	LEConnectionComplete = 0x01
 	LEAdvertisingReport  = 0x02
+	LEConnectionUpdate   = 0x03 // LE Connection Update Complete
 )
 
 // Event is a parsed HCI event packet (without the leading PacketTypeEvent
@@ -84,6 +87,28 @@ func (e Event) CommandStatus() (CommandStatus, error) {
 		Status:     e.Params[0],
 		NumPackets: e.Params[1],
 		Opcode:     binary.LittleEndian.Uint16(e.Params[2:4]),
+	}, nil
+}
+
+// HCI error codes (2.D.1)
+const ErrPinOrKeyMissing = 0x06
+
+// EncryptionChange holds the fields of an Encryption Change event (4.E.7.7.8).
+type EncryptionChange struct {
+	Status  uint8
+	Handle  uint16
+	Enabled bool
+}
+
+// EncryptionChange decodes the event as an Encryption Change event.
+func (e Event) EncryptionChange() (EncryptionChange, error) {
+	if e.Code != EventEncryptionChange || len(e.Params) < 4 {
+		return EncryptionChange{}, ErrShortPacket
+	}
+	return EncryptionChange{
+		Status:  e.Params[0],
+		Handle:  binary.LittleEndian.Uint16(e.Params[1:3]) & 0x0FFF,
+		Enabled: e.Params[3] != 0,
 	}, nil
 }
 
@@ -179,6 +204,75 @@ type ConnectionComplete struct {
 	Role     uint8
 	PeerType uint8
 	Peer     [6]byte
+	ConnParams
+}
+
+// ConnParams are a connection's timing parameters as the controller reports
+// them: interval in 1.25 ms units, latency in connection events, supervision
+// timeout in 10 ms units.
+type ConnParams struct {
+	Interval, Latency, Timeout uint16
+}
+
+func (c ConnParams) String() string {
+	return fmt.Sprintf("interval %.2f ms, latency %d, supervision timeout %d ms",
+		float64(c.Interval)*1.25, c.Latency, int(c.Timeout)*10)
+}
+
+func parseConnParams(p []byte) ConnParams {
+	return ConnParams{
+		Interval: binary.LittleEndian.Uint16(p[0:2]),
+		Latency:  binary.LittleEndian.Uint16(p[2:4]),
+		Timeout:  binary.LittleEndian.Uint16(p[4:6]),
+	}
+}
+
+// ConnectionUpdate holds an LE Connection Update Complete event.
+type ConnectionUpdate struct {
+	Status uint8
+	Handle uint16
+	ConnParams
+}
+
+// ConnectionUpdate decodes the event as an LE Connection Update Complete event.
+func (e Event) ConnectionUpdate() (ConnectionUpdate, error) {
+	sub, err := e.LESubevent()
+	if err != nil || sub != LEConnectionUpdate || len(e.Params) < 10 {
+		return ConnectionUpdate{}, ErrShortPacket
+	}
+	p := e.Params
+	return ConnectionUpdate{
+		Status:     p[1],
+		Handle:     binary.LittleEndian.Uint16(p[2:4]) & 0x0FFF,
+		ConnParams: parseConnParams(p[4:10]),
+	}, nil
+}
+
+// ErrorName names common HCI error codes (Vol 1 Part F).
+func ErrorName(code uint8) string {
+	if s, ok := map[uint8]string{
+		0x00: "success",
+		0x02: "unknown connection identifier",
+		0x05: "authentication failure",
+		0x06: "PIN or key missing",
+		0x08: "connection timeout",
+		0x0C: "command disallowed",
+		0x12: "invalid parameters",
+		0x13: "remote user terminated connection",
+		0x14: "remote device terminated: low resources",
+		0x15: "remote device terminated: power off",
+		0x16: "connection terminated by local host",
+		0x1A: "unsupported remote feature",
+		0x1F: "unspecified error",
+		0x22: "LL response timeout",
+		0x28: "instant passed",
+		0x3B: "unacceptable connection parameters",
+		0x3D: "MIC failure",
+		0x3E: "connection failed to be established",
+	}[code]; ok {
+		return s
+	}
+	return "unknown error"
 }
 
 // ConnectionComplete decodes the event as an LE Connection Complete event.
@@ -198,5 +292,8 @@ func (e Event) ConnectionComplete() (ConnectionComplete, error) {
 		PeerType: p[5],
 	}
 	copy(cc.Peer[:], p[6:12])
+	if len(p) >= 18 {
+		cc.ConnParams = parseConnParams(p[12:18])
+	}
 	return cc, nil
 }

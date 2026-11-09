@@ -30,6 +30,22 @@ type HCIOptions struct {
 	// Interface will claim a specific USB interface number instead of
 	// scanning and detecting which is a Wireless Controller interface
 	Interface int
+
+	// Bonds persists the local address and pairing keys across runs. When
+	// nil, bonds last only as long as the adapter.
+	Bonds BondStore
+
+	// ConfirmPasskey is called during Numeric Comparison pairing with the
+	// six-digit value the peer also shows, and reports whether the user
+	// confirmed they match. When nil every value is accepted: the link still
+	// meets a peer's MITM requirement (security level 4) but, with nobody
+	// comparing, is no better protected against a MITM than Just Works.
+	ConfirmPasskey func(passkey uint32) bool
+
+	// Logf, when set, receives a line per link-level operation: connection
+	// setup and parameter changes, MTU exchange, pairing and encryption
+	// steps, ATT errors, and disconnection.
+	Logf func(format string, args ...any)
 }
 
 // hciAdapter is the raw USB HCI backend.
@@ -45,6 +61,13 @@ type hciAdapter struct {
 	aclOut  *gousb.OutEndpoint // ACL data to controller (bulk OUT)
 
 	randomAddr [6]byte // random static address, in transmission (LE) order
+
+	bondMu    sync.Mutex
+	bondStore BondStore // nil: keep bonds in memory only
+	bonds     BondState
+
+	confirmPasskey func(passkey uint32) bool
+	logFn          func(format string, args ...any)
 
 	aclMaxData int           // controller's max ACL data bytes per packet
 	aclSem     chan struct{} // in-flight ACL packets, capped at the controller's buffer count
@@ -85,16 +108,89 @@ func NewHCIAdapter(opts HCIOptions) (Adapter, error) {
 	}
 
 	a := &hciAdapter{
-		ctx:        ctx,
-		dev:        dev,
-		randomAddr: newRandomStaticAddress(),
-		devices:    make(map[uint16]*hciDevice),
+		ctx:            ctx,
+		dev:            dev,
+		bondStore:      opts.Bonds,
+		confirmPasskey: opts.ConfirmPasskey,
+		logFn:          opts.Logf,
+		devices:        make(map[uint16]*hciDevice),
 	}
 	if err := a.claim(ifaceNum); err != nil {
 		a.Close()
 		return nil, err
 	}
+	if err := a.loadBonds(); err != nil {
+		a.Close()
+		return nil, err
+	}
 	return a, nil
+}
+
+// logf reports a link-level operation to HCIOptions.Logf, if set.
+func (a *hciAdapter) logf(format string, args ...any) {
+	if a.logFn != nil {
+		a.logFn(format, args...)
+	}
+}
+
+// loadBonds reads the saved bond state and adopts its local address,
+// generating and saving one on first use.
+func (a *hciAdapter) loadBonds() error {
+	if a.bondStore != nil {
+		st, err := a.bondStore.Load()
+		if err != nil {
+			return fmt.Errorf("load bonds: %w", err)
+		}
+		a.bonds = st
+	}
+	if a.bonds.LocalAddress.MAC == ([6]byte{}) {
+		le := newRandomStaticAddress()
+		a.bonds.LocalAddress = Address{MAC: [6]byte(hci.Reverse(le[:])), IsRandom: true}
+		if err := a.saveBondsLocked(); err != nil {
+			return err
+		}
+	}
+	a.randomAddr = [6]byte(hci.Reverse(a.bonds.LocalAddress.MAC[:]))
+	return nil
+}
+
+// saveBondsLocked writes the bond state to the store, if any. a.bondMu must be
+// held (or the adapter not yet shared).
+func (a *hciAdapter) saveBondsLocked() error {
+	if a.bondStore == nil {
+		return nil
+	}
+	if err := a.bondStore.Save(a.bonds); err != nil {
+		return fmt.Errorf("save bonds: %w", err)
+	}
+	return nil
+}
+
+func (a *hciAdapter) findBond(addr Address) (Bond, bool) {
+	a.bondMu.Lock()
+	defer a.bondMu.Unlock()
+	return a.bonds.find(addr)
+}
+
+func (a *hciAdapter) saveBond(b Bond) error {
+	a.bondMu.Lock()
+	defer a.bondMu.Unlock()
+	a.bonds.put(b)
+	return a.saveBondsLocked()
+}
+
+func (a *hciAdapter) deleteBond(addr Address) error {
+	a.bondMu.Lock()
+	defer a.bondMu.Unlock()
+	a.bonds.remove(addr)
+	return a.saveBondsLocked()
+}
+
+// resolve maps a bonded peer's resolvable private address to its identity.
+func (a *hciAdapter) resolve(addr Address) Address {
+	a.bondMu.Lock()
+	defer a.bondMu.Unlock()
+	return a.bonds.resolve(addr)
 }
 
 // Controller describes the USB Bluetooth controller this adapter opened.
@@ -312,7 +408,7 @@ func (a *hciAdapter) scanReadLoop(ctx context.Context, sess *hciScanSession, res
 		if reports, err := ev.AdvertisingReports(); err == nil {
 			for _, r := range reports {
 				select {
-				case results <- scanResultFromReport(merged.merge(r)):
+				case results <- a.scanResultFromReport(merged.merge(r)):
 				default: // delivery backlog; drop rather than stall the reader
 				}
 			}
@@ -391,14 +487,15 @@ func (m advMerger) merge(r hci.AdvertisingReport) mergedReport {
 	return mergedReport{r, len(p.adv)}
 }
 
-// scanResultFromReport converts an HCI advertising report into a ScanResult.
-func scanResultFromReport(r mergedReport) ScanResult {
+// scanResultFromReport converts an HCI advertising report into a ScanResult,
+// reporting a bonded peer by its identity address.
+func (a *hciAdapter) scanResultFromReport(r mergedReport) ScanResult {
 	var addr Address
 	for i := range 6 {
 		addr.MAC[i] = r.Addr[5-i]
 	}
 	addr.IsRandom = r.AddrType == hci.AddressRandom
-	return ScanResult{Address: addr, RSSI: r.RSSI, payload: r.Data, split: true, advLen: r.advLen}
+	return ScanResult{Address: a.resolve(addr), RSSI: r.RSSI, payload: r.Data, split: true, advLen: r.advLen}
 }
 
 // Connect establishes an LE connection to the peripheral at addr, then drives
@@ -420,17 +517,21 @@ func (a *hciAdapter) Connect(ctx context.Context, addr Address, params ConnectPa
 	cctx, cancel := withConnectTimeout(ctx)
 	defer cancel()
 
-	var peer [6]byte
-	for i := range 6 {
-		peer[i] = addr.MAC[5-i] // MAC order -> transmission (little-endian) order
-	}
-	peerType := uint8(hci.AddressPublic)
+	// A bonded peer is addressed by identity but reached at its current
+	// resolvable private address.
+	addr = a.resolve(addr)
+	target, peerType := addr.MAC, uint8(hci.AddressPublic)
 	if addr.IsRandom {
 		peerType = hci.AddressRandom
 	}
+	if addr.rpa != ([6]byte{}) {
+		target, peerType = addr.rpa, hci.AddressRandom
+	}
+	peer := [6]byte(hci.Reverse(target[:])) // MAC order -> transmission (little-endian) order
 	// scan interval/window 60/30 ms; connection interval 30-50 ms; no latency;
 	// supervision timeout 4 s (units: 0.625 ms, 1.25 ms, 10 ms respectively).
 	// TODO: configurable?
+	a.logf("connect: LE Create Connection to %s (%s address)", Address{MAC: target, IsRandom: peerType == hci.AddressRandom}, addrTypeName(peerType))
 	cmd := hci.CreateConnection(0x0060, 0x0030, peerType, peer, hci.AddressRandom, 0x0018, 0x0028, 0, 0x0190)
 	if err := a.command(cctx, cmd); err != nil { // returns on Command Status
 		return nil, fmt.Errorf("create connection: %w", err)
@@ -456,10 +557,11 @@ func (a *hciAdapter) Connect(ctx context.Context, addr Address, params ConnectPa
 		return nil, fmt.Errorf("%w: awaiting connection: %w", ErrNotConnected, cctx.Err())
 	}
 	if cc.Status != 0 {
-		return nil, fmt.Errorf("%w: connection failed with status %#x", ErrNotConnected, cc.Status)
+		return nil, fmt.Errorf("%w: connection failed with status %#x (%s)", ErrNotConnected, cc.Status, hci.ErrorName(cc.Status))
 	}
+	a.logf("connected: handle %#03x, %s", cc.Handle, cc.ConnParams)
 
-	dev := newHCIDevice(a, cc.Handle, addr)
+	dev := newHCIDevice(a, cc.Handle, addr, cc.PeerType, cc.Peer)
 	a.mu.Lock()
 	a.devices[cc.Handle] = dev
 	a.startReadersLocked()
@@ -473,6 +575,7 @@ func (a *hciAdapter) Connect(ctx context.Context, addr Address, params ConnectPa
 // command is sent without synchronously awaiting its completion event, since the
 // background event reader owns the event endpoint while connected.
 func (a *hciAdapter) disconnect(handle uint16) error {
+	a.logf("disconnect: handle %#03x, by us", handle)
 	_ = a.sendCommand(hci.Disconnect(handle, 0x13)) // 0x13: remote user terminated
 	a.handleDisconnect(handle)
 	return nil
@@ -511,8 +614,32 @@ func (a *hciAdapter) eventLoop(ctx context.Context) {
 		}
 		switch ev.Code {
 		case hci.EventDisconnectionComplete:
-			if len(ev.Params) >= 3 {
+			if len(ev.Params) >= 4 {
+				a.logf("disconnected: reason %#02x (%s)", ev.Params[3], hci.ErrorName(ev.Params[3]))
 				a.handleDisconnect(binary.LittleEndian.Uint16(ev.Params[1:3]))
+			}
+		case hci.EventEncryptionChange:
+			if ec, err := ev.EncryptionChange(); err == nil {
+				a.logf("encryption change: enabled %v, status %#02x (%s)", ec.Enabled, ec.Status, hci.ErrorName(ec.Status))
+				if dev := a.device(ec.Handle); dev != nil {
+					dev.encryptionChanged(ec.Status, ec.Enabled)
+				}
+			}
+		case hci.EventCommandStatus:
+			// A rejected HCI_LE_Enable_Encryption produces no Encryption
+			// Change; report the failure instead. Only one connection is
+			// supported, so it belongs to whichever device is waiting.
+			if cs, err := ev.CommandStatus(); err == nil && cs.Opcode == hci.OpLEEnableEncryption && cs.Status != 0 {
+				a.logf("enable encryption rejected: status %#02x (%s)", cs.Status, hci.ErrorName(cs.Status))
+				a.mu.Lock()
+				for _, dev := range a.devices {
+					dev.encryptionChanged(cs.Status, false)
+				}
+				a.mu.Unlock()
+			}
+		case hci.EventLEMeta:
+			if cu, err := ev.ConnectionUpdate(); err == nil {
+				a.logf("connection update: status %#02x, %s", cu.Status, cu.ConnParams)
 			}
 		case hci.EventNumberOfCompletedPackets:
 			if pkts, err := ev.NumberOfCompletedPackets(); err == nil {
@@ -557,6 +684,8 @@ func (a *hciAdapter) aclLoop(ctx context.Context) {
 			a.dispatchATT(frag.Handle, payload)
 		case hci.CIDLESignal:
 			a.handleSignaling(frag.Handle, payload)
+		case hci.CIDSecurity:
+			a.dispatchSMP(frag.Handle, payload)
 		}
 	}
 }
@@ -588,8 +717,48 @@ func (a *hciAdapter) handleSignaling(handle uint16, pdu []byte) {
 	if len(pdu) < 2 || pdu[0] != hci.SigConnParamUpdateRequest {
 		return
 	}
+	if len(pdu) >= 12 {
+		p := pdu[4:]
+		a.logf("L2CAP connection parameter update request: interval %.2f-%.2f ms, latency %d, supervision timeout %d ms (accepted)",
+			float64(binary.LittleEndian.Uint16(p[0:2]))*1.25, float64(binary.LittleEndian.Uint16(p[2:4]))*1.25,
+			binary.LittleEndian.Uint16(p[4:6]), int(binary.LittleEndian.Uint16(p[6:8]))*10)
+	}
 	identifier := pdu[1]
 	_ = a.sendL2CAP(handle, hci.CIDLESignal, hci.ConnParamUpdateResponse(identifier, 0x0000))
+}
+
+// device returns the connected device with the given handle, or nil.
+func (a *hciAdapter) device(handle uint16) *hciDevice {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.devices[handle]
+}
+
+// dispatchSMP routes an inbound SMP PDU. A peripheral's Security Request starts
+// pairing (or encryption with an existing bond) in the background; everything
+// else belongs to a pairing in progress.
+func (a *hciAdapter) dispatchSMP(handle uint16, pdu []byte) {
+	dev := a.device(handle)
+	if dev == nil || len(pdu) == 0 {
+		return
+	}
+	if pdu[0] == hci.SMPSecurityRequest {
+		if len(pdu) >= 2 {
+			a.logf("SMP: peer sent Security Request (AuthReq %#02x)", pdu[1])
+		}
+		go func() {
+			// Nothing waits on this; keep the error to explain the disconnect
+			// a peer typically follows a failed pairing with.
+			if err := dev.secure(); err != nil {
+				dev.secErr.Store(&err)
+			}
+		}()
+		return
+	}
+	select {
+	case dev.smpRx <- pdu:
+	default: // nobody is pairing; drop
+	}
 }
 
 // dispatchATT routes an inbound ATT PDU to a notification callback or to the
@@ -614,6 +783,7 @@ func (a *hciAdapter) dispatchATT(handle uint16, pdu []byte) {
 	if pdu[0] == hci.ATTExchangeMTURequest {
 		if len(pdu) >= 3 {
 			dev.setMTU(min(binary.LittleEndian.Uint16(pdu[1:3]), hostRxMTU))
+			a.logf("ATT MTU exchange (peer-initiated): peer %d, ours %d, using %d", binary.LittleEndian.Uint16(pdu[1:3]), hostRxMTU, dev.attMTU())
 		}
 		_ = a.sendACL(handle, hci.ExchangeMTUResponse(hostRxMTU))
 		return
@@ -656,4 +826,11 @@ func (a *hciAdapter) sendL2CAP(handle, cid uint16, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+func addrTypeName(t uint8) string {
+	if t == hci.AddressRandom {
+		return "random"
+	}
+	return "public"
 }

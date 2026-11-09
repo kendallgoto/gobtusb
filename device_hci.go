@@ -2,6 +2,7 @@ package gobtusb
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -25,7 +26,19 @@ const hostRxMTU = 247
 type hciDevice struct {
 	adapter *hciAdapter
 	handle  uint16
-	addr    Address
+
+	addrMu sync.Mutex
+	addr   Address // becomes the identity address once the peer distributes it
+
+	// Over-the-air peer address from LE Connection Complete, as type ‖
+	// address (most significant octet first), for pairing.
+	peerAddr []byte
+
+	secMu     sync.Mutex            // serializes pairing/encryption
+	encrypted atomic.Bool           // link encryption is on
+	smpRx     chan []byte           // inbound SMP PDUs
+	encDone   chan encryptResult    // outcome of HCI_LE_Enable_Encryption
+	secErr    atomic.Pointer[error] // last failure of a peer-requested pairing
 
 	attMu   sync.Mutex  // serializes ATT transactions (one outstanding request)
 	pendMu  sync.Mutex  // protects pending
@@ -40,13 +53,16 @@ type hciDevice struct {
 	mtu atomic.Uint32 // negotiated ATT MTU
 }
 
-func newHCIDevice(a *hciAdapter, handle uint16, addr Address) *hciDevice {
+func newHCIDevice(a *hciAdapter, handle uint16, addr Address, peerType uint8, peer [6]byte) *hciDevice {
 	d := &hciDevice{
-		adapter: a,
-		handle:  handle,
-		addr:    addr,
-		notify:  make(map[uint16]func([]byte)),
-		disc:    make(chan struct{}),
+		adapter:  a,
+		handle:   handle,
+		addr:     addr,
+		peerAddr: append([]byte{peerType & 0x01}, hci.Reverse(peer[:])...),
+		smpRx:    make(chan []byte, 8),
+		encDone:  make(chan encryptResult, 1),
+		notify:   make(map[uint16]func([]byte)),
+		disc:     make(chan struct{}),
 	}
 	d.mtu.Store(hci.DefaultMTU)
 	return d
@@ -64,21 +80,50 @@ func (d *hciDevice) attMTU() int { return int(d.mtu.Load()) }
 func (d *hciDevice) exchangeMTU(rx uint16) {
 	resp, err := d.attRequest(hci.ExchangeMTURequest(rx))
 	if err != nil {
+		d.adapter.logf("ATT MTU exchange failed: %v; using %d", err, d.attMTU())
 		return
 	}
 	if len(resp) >= 3 && resp[0] == hci.ATTExchangeMTUResponse {
-		d.setMTU(min(rx, binary.LittleEndian.Uint16(resp[1:3])))
+		peer := binary.LittleEndian.Uint16(resp[1:3])
+		d.setMTU(min(rx, peer))
+		d.adapter.logf("ATT MTU exchange: ours %d, peer %d, using %d", rx, peer, d.attMTU())
 	}
 }
 
-func (d *hciDevice) Address() Address { return d.addr }
+func (d *hciDevice) Address() Address {
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	return d.addr
+}
 
 func (d *hciDevice) Disconnect() error { return d.adapter.disconnect(d.handle) }
 
 func (d *hciDevice) Disconnected() <-chan struct{} { return d.disc }
 
 // attRequest sends an ATT request PDU and waits for the matching response PDU.
+// If the peer refuses it for lack of security, the link is paired (or
+// encrypted with an existing bond) and the request retried once, much as OS
+// stacks do.
 func (d *hciDevice) attRequest(req []byte) ([]byte, error) {
+	resp, err := d.attTransact(req)
+	if err != nil || d.encrypted.Load() {
+		return resp, err
+	}
+	if e, ok := hci.ParseErrorResponse(resp); ok {
+		switch e.Code {
+		case hci.ATTErrInsufficientAuthentication, hci.ATTErrInsufficientEncryption, hci.ATTErrInsufficientEncKeySize:
+			d.adapter.logf("ATT: request %#02x on handle %#04x refused (%s); securing link and retrying", e.ReqOpcode, e.Handle, hci.ATTErrorName(e.Code))
+			if err := d.secure(); err != nil {
+				return nil, fmt.Errorf("securing link: %w", err)
+			}
+			return d.attTransact(req)
+		}
+	}
+	return resp, nil
+}
+
+// attTransact performs one ATT request/response transaction.
+func (d *hciDevice) attTransact(req []byte) ([]byte, error) {
 	d.attMu.Lock()
 	defer d.attMu.Unlock()
 
@@ -98,7 +143,7 @@ func (d *hciDevice) attRequest(req []byte) ([]byte, error) {
 	select {
 	case resp := <-ch:
 		if resp == nil {
-			return nil, ErrNotConnected
+			return nil, d.notConnected()
 		}
 		return resp, nil
 	case <-time.After(attTimeout):
@@ -183,6 +228,13 @@ func (d *hciDevice) DiscoverServices(uuids []UUID) ([]Service, error) {
 	}
 	return out, nil
 }
+
+var (
+	_ GATTTabler = (*hciDevice)(nil)
+	_ Securer    = (*hciDevice)(nil)
+)
+
+func (d *hciDevice) Secure() error { return d.secure() }
 
 // hciService is a discovered GATT service with its handle range.
 type hciService struct {
@@ -338,40 +390,113 @@ func (c *hciCharacteristic) findCCCD() (uint16, error) {
 	if c.cccdHandle != 0 {
 		return c.cccdHandle, nil
 	}
+	descs, err := c.descriptors()
+	if err != nil {
+		return 0, err
+	}
 	cccdUUID := New16BitUUID(hci.GATTCCCD)
+	for _, d := range descs {
+		if d.UUID == cccdUUID {
+			c.cccdHandle = d.Handle
+			return d.Handle, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: no CCCD for characteristic %s", ErrCharacteristicNotFound, c.uuid)
+}
+
+// descriptors discovers the attributes after the characteristic's value, up
+// to the next characteristic.
+func (c *hciCharacteristic) descriptors() ([]GATTDescriptor, error) {
+	var out []GATTDescriptor
 	start := c.valueHandle + 1
 	for start != 0 && start <= c.endHandle {
 		resp, err := c.dev.attRequest(hci.FindInformationRequest(start, c.endHandle))
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if e, ok := hci.ParseErrorResponse(resp); ok {
 			if e.Code == hci.ATTErrAttributeNotFound {
 				break
 			}
-			return 0, fmt.Errorf("find descriptors: ATT error %#x", e.Code)
+			return nil, fmt.Errorf("find descriptors: ATT error %#x (%s)", e.Code, hci.ATTErrorName(e.Code))
 		}
 		infos, err := hci.ParseFindInformationResponse(resp)
 		if err != nil {
-			return 0, fmt.Errorf("find descriptors: %w", err)
+			return nil, fmt.Errorf("find descriptors: %w", err)
 		}
 		if len(infos) == 0 {
 			break
 		}
-		var last uint16
 		for _, info := range infos {
-			if advUUID(info.UUID) == cccdUUID {
-				c.cccdHandle = info.Handle
-				return info.Handle, nil
-			}
-			last = info.Handle
+			out = append(out, GATTDescriptor{UUID: advUUID(info.UUID), Handle: info.Handle})
 		}
+		last := infos[len(infos)-1].Handle
 		if last >= c.endHandle {
 			break
 		}
 		start = last + 1
 	}
-	return 0, fmt.Errorf("%w: no CCCD for characteristic %s", ErrCharacteristicNotFound, c.uuid)
+	return out, nil
+}
+
+// read reads an attribute's value with ATT Read Request, which returns at
+// most ATT_MTU-1 bytes; longer values are truncated.
+func (d *hciDevice) read(handle uint16) ([]byte, error) {
+	resp, err := d.attRequest(hci.ReadRequest(handle))
+	if err != nil {
+		return nil, err
+	}
+	if e, ok := hci.ParseErrorResponse(resp); ok {
+		return nil, fmt.Errorf("ATT error %#x (%s)", e.Code, hci.ATTErrorName(e.Code))
+	}
+	if len(resp) == 0 || resp[0] != hci.ATTReadResponse {
+		return nil, fmt.Errorf("unexpected ATT response %x", resp)
+	}
+	return resp[1:], nil
+}
+
+// GATTTable discovers every primary service, characteristic and descriptor,
+// reading each readable value along the way. A read that fails is recorded in
+// the attribute's ReadErr rather than aborting the walk.
+func (d *hciDevice) GATTTable() ([]GATTService, error) {
+	services, err := d.DiscoverServices(nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []GATTService
+	for _, svc := range services {
+		s := svc.(*hciService)
+		gs := GATTService{UUID: s.uuid, Start: s.start, End: s.end}
+		chars, err := s.DiscoverCharacteristics(nil)
+		if err != nil {
+			return nil, err
+		}
+		for _, ch := range chars {
+			c := ch.(*hciCharacteristic)
+			gc := GATTCharacteristic{UUID: c.uuid, Handle: c.declHandle, ValueHandle: c.valueHandle, Properties: c.props}
+			if c.props&PropRead != 0 {
+				gc.Value, gc.ReadErr = d.readForTable(c.valueHandle)
+			}
+			if gc.Descriptors, err = c.descriptors(); err != nil {
+				return nil, err
+			}
+			for i := range gc.Descriptors {
+				desc := &gc.Descriptors[i]
+				desc.Value, desc.ReadErr = d.readForTable(desc.Handle)
+			}
+			gs.Characteristics = append(gs.Characteristics, gc)
+		}
+		out = append(out, gs)
+	}
+	return out, nil
+}
+
+func (d *hciDevice) readForTable(handle uint16) ([]byte, string) {
+	v, err := d.read(handle)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return v, ""
 }
 
 func (c *hciCharacteristic) writeDescriptor(handle uint16, value []byte) error {
@@ -383,4 +508,130 @@ func (c *hciCharacteristic) writeDescriptor(handle uint16, value []byte) error {
 		return fmt.Errorf("write descriptor: ATT error %#x", e.Code)
 	}
 	return nil
+}
+
+// errKeyMissing means the peer no longer has the LTK we hold for it.
+var errKeyMissing = errors.New("peer has no key for this bond")
+
+type encryptResult struct {
+	status  uint8
+	enabled bool
+}
+
+// encryptionChanged delivers the outcome of an encryption attempt.
+func (d *hciDevice) encryptionChanged(status uint8, enabled bool) {
+	select {
+	case d.encDone <- encryptResult{status, enabled}:
+	default:
+	}
+}
+
+// secure encrypts the link: with the stored LTK if we are bonded to the peer,
+// otherwise by pairing (and bonding, when both sides want it).
+func (d *hciDevice) secure() error {
+	d.secMu.Lock()
+	defer d.secMu.Unlock()
+	if d.encrypted.Load() {
+		return nil
+	}
+
+	if b, ok := d.adapter.findBond(d.Address()); ok {
+		d.adapter.logf("security: bonded to %s; encrypting with the stored LTK", b.Address)
+		err := d.encrypt(b.LTK)
+		if !errors.Is(err, errKeyMissing) {
+			return err
+		}
+		// The peer has dropped our bond (e.g. after a factory reset); forget
+		// it too and pair afresh.
+		d.adapter.logf("security: peer has no key for our bond; deleting it and pairing again")
+		if err := d.adapter.deleteBond(b.Address); err != nil {
+			return err
+		}
+	}
+
+	local := d.adapter.bonds.LocalAddress.MAC // fixed once the adapter is open
+	d.adapter.logf("security: no bond; pairing")
+	res, err := pair(smpLink{
+		send:     func(pdu []byte) error { return d.adapter.sendL2CAP(d.handle, hci.CIDSecurity, pdu) },
+		rx:       d.drainedSMP(),
+		done:     d.disc,
+		encrypt:  d.encrypt,
+		confirm:  d.adapter.confirmPasskey,
+		logf:     d.adapter.logf,
+		initAddr: append([]byte{hci.AddressRandom}, local[:]...),
+		respAddr: d.peerAddr,
+	})
+	if err != nil {
+		d.adapter.logf("security: pairing failed: %v", err)
+		return err
+	}
+
+	addr := d.Address()
+	if res.identity != nil {
+		id := *res.identity
+		if isRPA(addr) {
+			id.rpa = addr.MAC
+		} else {
+			id.rpa = addr.rpa
+		}
+		addr = id
+		d.addrMu.Lock()
+		d.addr = id
+		d.addrMu.Unlock()
+	}
+	if !res.bonded {
+		d.adapter.logf("security: paired without bonding; keys not stored")
+		return nil
+	}
+	d.adapter.logf("security: bond saved for %s", addr)
+	return d.adapter.saveBond(Bond{Address: addr, LTK: res.ltk, IRK: res.irk})
+}
+
+// notConnected reports a dropped link, with the reason if it followed a
+// failed peer-requested pairing.
+func (d *hciDevice) notConnected() error {
+	if err := d.secErr.Load(); err != nil {
+		return fmt.Errorf("%w (after pairing failed: %w)", ErrNotConnected, *err)
+	}
+	return ErrNotConnected
+}
+
+// drainedSMP discards stale SMP PDUs left from an earlier attempt and returns
+// the channel for a new pairing.
+func (d *hciDevice) drainedSMP() <-chan []byte {
+	for {
+		select {
+		case <-d.smpRx:
+		default:
+			return d.smpRx
+		}
+	}
+}
+
+// encrypt starts link encryption with ltk (most significant octet first) and
+// waits for the controller to report the outcome.
+func (d *hciDevice) encrypt(ltk [16]byte) error {
+	select {
+	case <-d.encDone: // drop a stale result
+	default:
+	}
+	cmd := hci.LEEnableEncryption(d.handle, 0, 0, [16]byte(hci.Reverse(ltk[:])))
+	if err := d.adapter.sendCommand(cmd); err != nil {
+		return fmt.Errorf("enable encryption: %w", err)
+	}
+	select {
+	case r := <-d.encDone:
+		switch {
+		case r.status == hci.ErrPinOrKeyMissing:
+			return errKeyMissing
+		case r.status != 0 || !r.enabled:
+			return fmt.Errorf("enable encryption: status %#x", r.status)
+		}
+		d.encrypted.Store(true)
+		return nil
+	case <-d.disc:
+		return ErrNotConnected
+	case <-time.After(smpTimeout):
+		return errors.New("enable encryption: timed out")
+	}
 }

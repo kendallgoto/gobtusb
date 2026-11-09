@@ -25,7 +25,10 @@ const (
 
 // 3.F.3.4.1.1 Error response codes
 const (
-	ATTErrAttributeNotFound = 0x0A
+	ATTErrInsufficientAuthentication = 0x05
+	ATTErrAttributeNotFound          = 0x0A
+	ATTErrInsufficientEncKeySize     = 0x0C
+	ATTErrInsufficientEncryption     = 0x0F
 )
 
 // 3.G.3.4 GATT profile attributes
@@ -43,6 +46,37 @@ const (
 
 // 3.F.3.2.8 MTU used before any negotiation
 const DefaultMTU = 23
+
+// ReadRequest forms an ATT Read Request for the attribute at handle.
+func ReadRequest(handle uint16) []byte {
+	return []byte{ATTReadRequest, byte(handle), byte(handle >> 8)}
+}
+
+// ATTErrorName names an ATT error code (3.F.3.4.1.1).
+func ATTErrorName(code uint8) string {
+	if s, ok := map[uint8]string{
+		0x01: "invalid handle",
+		0x02: "read not permitted",
+		0x03: "write not permitted",
+		0x04: "invalid PDU",
+		0x05: "insufficient authentication",
+		0x06: "request not supported",
+		0x07: "invalid offset",
+		0x08: "insufficient authorization",
+		0x09: "prepare queue full",
+		0x0A: "attribute not found",
+		0x0B: "attribute not long",
+		0x0C: "insufficient encryption key size",
+		0x0D: "invalid attribute value length",
+		0x0E: "unlikely error",
+		0x0F: "insufficient encryption",
+		0x10: "unsupported group type",
+		0x11: "insufficient resources",
+	}[code]; ok {
+		return s
+	}
+	return "application error"
+}
 
 // WriteRequest forms the payload for an acknowledged write
 func WriteRequest(handle uint16, value []byte) []byte {

@@ -19,6 +19,10 @@ type Address struct {
 	// uuid is the reference in CoreBluetooth since MAC is obscured.
 	// on other backends, it is unused.
 	uuid UUID
+
+	// rpa is the resolvable private address (MAC order) a bonded peer was
+	// seen at, when MAC holds its identity address. HCI backend only.
+	rpa [6]byte
 }
 
 // String formats the address as "aa:bb:cc:dd:ee:ff" (or the CoreBluetooth

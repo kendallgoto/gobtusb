@@ -3,7 +3,7 @@
 //
 // It is transport-agnostic and would work over USB or UART for HCI.
 //
-// References: Bluetooth Core Specification 5.4, 3.A (L2CAP), 3.F (ATT), 4.E (HCI)
+// References: Bluetooth Core Specification 5.4, 3.A (L2CAP), 3.F (ATT), 3.H (SMP), 4.E (HCI)
 package hci
 
 import "encoding/binary"
@@ -27,6 +27,7 @@ const (
 	OpLESetScanEnable       = 0x200C
 	OpLECreateConnection    = 0x200D
 	OpLECreateConnectionCxl = 0x200E
+	OpLEEnableEncryption    = 0x2019
 )
 
 // LEReadBufferSize builds an HCI_LE_Read_Buffer_Size command, which reports the
@@ -59,6 +60,18 @@ func Disconnect(handle uint16, reason uint8) Command {
 	binary.LittleEndian.PutUint16(p[0:2], handle)
 	p[2] = reason
 	return Command{Opcode: OpDisconnect, Params: p}
+}
+
+// LEEnableEncryption builds an HCI_LE_Enable_Encryption command (4.E.7.8.24).
+// ltk is in HCI (little-endian) order. LE Secure Connections keys use a zero
+// rand and ediv.
+func LEEnableEncryption(handle uint16, rand uint64, ediv uint16, ltk [16]byte) Command {
+	p := make([]byte, 28)
+	binary.LittleEndian.PutUint16(p[0:2], handle)
+	binary.LittleEndian.PutUint64(p[2:10], rand)
+	binary.LittleEndian.PutUint16(p[10:12], ediv)
+	copy(p[12:28], ltk[:])
+	return Command{Opcode: OpLEEnableEncryption, Params: p}
 }
 
 // SetRandomAddress builds an HCI_LE_Set_Random_Address command.
