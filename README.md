@@ -62,3 +62,20 @@ adapter, err := gobtusb.NewHCIAdapter(gobtusb.HCIOptions{Bonds: myStore})
 
 - `HCIOptions.Logf` receives one line per link-level operation: connection setup and parameter updates, MTU exchange, Security Requests, each pairing step, encryption changes, ATT errors that trigger pairing, and disconnect reasons.
 - A connected HCI `Device` implements `GATTTabler`. `GATTTable()` walks every primary service, characteristic and descriptor with their handles, and reads each readable value (up to ATT_MTU-1 bytes). A failed read is recorded on the attribute instead of stopping the walk.
+
+## btcli
+
+`cmd/btcli` is a small command-line tool that runs the library's main workflows, and serves as sample code for them.
+
+```sh
+go run ./cmd/btcli controllers                          # USB Bluetooth controllers attached
+go run ./cmd/btcli -hci scan -t 5s -name Sensor -raw    # list devices; -raw splits advertisement / scan response
+go run ./cmd/btcli -hci scan -uuid 180d                 # only devices advertising a service
+go run ./cmd/btcli -hci -v gatt aa:bb:cc:dd:ee:ff       # connect and walk the GATT table, with link log
+go run ./cmd/btcli -hci write aa:bb:cc:dd:ee:ff 2a06 01 # write (add -noresp for Write Without Response)
+go run ./cmd/btcli -hci notify aa:bb:cc:dd:ee:ff 2a37   # subscribe, print until Ctrl-C
+go run ./cmd/btcli -hci pair aa:bb:cc:dd:ee:ff          # pair and bond on demand
+go run ./cmd/btcli bonds [-delete aa:bb:cc:dd:ee:ff]    # list or delete stored bonds
+```
+
+Without `-hci` it uses the OS stack (CoreBluetooth on macOS), where addresses are CoreBluetooth identifiers and `gatt` lists UUIDs only. With `-hci`, bonds and the local address are kept in `~/.btcli/bonds.json` (`-bonds ""` keeps them in memory only).
